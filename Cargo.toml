@@ -1,0 +1,9 @@
+[package]
+name = "rtcm2rnx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.17"
+rinex = "^0.17.0-alpha-1"
+rtcm-rs = "0.11.0"
