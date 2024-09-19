@@ -1,6 +1,6 @@
 ## rtcm2rnx
 
-Tools for converting RTCM data into RINEX and Georust data structures. Mirros RTCM conversion methods found in RTKLIB. 
+Tools for converting RTCM data into RINEX and Georust data structures. Mirrors RTCM conversion methods found in RTKLIB. 
 
 Current status:
 * WIP support for GPS and Galileo MSM7 to RINEX OBS
