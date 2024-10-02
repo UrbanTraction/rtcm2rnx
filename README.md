@@ -5,7 +5,7 @@ Tools for converting RTCM data into RINEX and Georust data structures. Mirrors R
 Current status:
 * WIP support for GPS and Galileo MSM7 to RINEX OBS
 * Command line interface: `rtcm2rnx convert <path_to_rtcm_file>`
-* Test framework using rtklib (via (rtklib-ffi)[https://github.com/kpwebb/rtklib-ffi] buildgen import) 
+* Test framework using rtklib (via [rtklib-ffi](https://github.com/kpwebb/rtklib-ffi) buildgen import) 
   
 
 Next Steps:
