@@ -2,8 +2,19 @@
 name = "rtcm2rnx"
 version = "0.1.0"
 edition = "2021"
+git-fetch-with-cli = true
 
 [dependencies]
+build = "0.0.2"
+cargo = "0.82.0"
 clap = "4.5.17"
-rinex = "^0.17.0-alpha-1"
+cty = "0.2.2"
+rtcmlib = { version = "0.1.0", path = "rtcmlib" }
+
+
+[dev-dependencies]
+rtklib-sys = { git = "https://github.com/kpwebb/rtklib-ffi.git", version ="0.1.3" }
 rtcm-rs = "0.11.0"
+float-cmp = "0.10.0"
+rinex = "^0.17.0-alpha-1"
+
