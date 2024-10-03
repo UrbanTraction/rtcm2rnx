@@ -11,5 +11,3 @@ Current status:
 Next Steps:
 * Build lib interface for integrating into RTCM stream processor (Tokio Async, etc.)
 * Merge CLI into georust/rinex?
-
-  

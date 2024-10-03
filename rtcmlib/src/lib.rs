@@ -1,7 +1,7 @@
 #![allow(warnings)] 
 
 use std::{  collections::{BTreeMap, HashMap}, fs::{File}, io::{Read} };
-use rinex::{observation::{ HeaderFields, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
+use rinex::{observation::{ Crinex, HeaderFields, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
 
 use rtcm_rs::{msg::{Msg1077T, Msg1097Data, Msg1097T, Msm57Sat}, Message, MsgFrameIter};
 
@@ -201,7 +201,7 @@ fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, Observati
     }
     
     if signal.cnr.is_some() {
-        let cnr_obs = (signal.cnr.unwrap() as f64) / 0.001 + 0.5 ;
+        let cnr_obs = (signal.cnr.unwrap() as f64);
         let code = Observable::SSI(format!("S{}", code_str));
         observation_data.insert(code, 
                                 ObservationData {obs:cnr_obs, lli: None, snr: None});
@@ -223,13 +223,6 @@ pub fn process_msm1077( msg:Msg1077T)  -> BTreeMap<SV, HashMap<Observable, Obser
     let mut i = 0;
     for signal in msg.data_segment.signal_data.iter() {
     
-        // if  signal.gnss_signal_fine_pseudorange_ext_ms.is_none() || 
-        //     signal.gnss_signal_fine_phaserange_ext_ms.is_none() || 
-        //     signal.gnss_signal_fine_phaserange_rate_m_s.is_none() ||
-        //     signal.gnss_signal_cnr_ext_dbhz.is_none() {
-        //     continue;
-        // }
-
         let signal:Msm7Data  = Msm7Data {
             constellation: Constellation::GPS, 
             satellite_id: signal.satellite_id, 
@@ -272,12 +265,6 @@ pub fn process_msm1097( msg:Msg1097T)  -> BTreeMap<SV, HashMap<Observable, Obser
     let mut i = 0;
     for signal in msg.data_segment.signal_data.iter() {
     
-        // if  signal.gnss_signal_fine_pseudorange_ext_ms.is_none() || 
-        //     signal.gnss_signal_fine_phaserange_ext_ms.is_none() || 
-        //     signal.gnss_signal_fine_phaserange_rate_m_s.is_none() ||
-        //     signal.gnss_signal_cnr_ext_dbhz.is_none() {
-        //     continue;
-        // }
 
         if signal.satellite_id == 11 {
             println!("debug")
@@ -317,7 +304,7 @@ pub fn convert_file(file_path:&String) {
     if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
 
         // implement optional compressed rnx ?
-        //let crinex:Option<Crinex> = Some(Crinex {version : Version {major: 3, minor: 0}, prog: "rtcm2rnx".to_string(), date: Epoch::now().unwrap()});  
+        let crinex:Option<Crinex> = Some(Crinex {version : Version {major: 3, minor: 0}, prog: "rtcm2rnx".to_string(), date: Epoch::now().unwrap()});  
 
         let scaling:HashMap<(Constellation, Observable), u16> = HashMap::new();
 
@@ -326,6 +313,9 @@ pub fn convert_file(file_path:&String) {
 
         let mut gps_week:Option<u64>  = None;
         let mut galileo_week:Option<u64>  = None;
+
+        let mut first_epoch:Option<Epoch> = None;
+        let mut last_epoch:Option<Epoch> = None;
 
         for message_frame in &mut iterator {
             if message_frame.message_number().is_some() {
@@ -353,7 +343,14 @@ pub fn convert_file(file_path:&String) {
                                 let time = msg1077.gps_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_gps_time2epoch(time, gps_week.unwrap());
 
-                            
+                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
+                                    first_epoch = Some(msm_epoch);
+                                }
+
+                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
+                                    last_epoch = Some(msm_epoch);
+                                }
+                                
                                 let mut buff:[u8; 1200] = [0;1200];
 
                                 let mut i = 0;
@@ -384,7 +381,14 @@ pub fn convert_file(file_path:&String) {
                                 let time = msg1097.gal_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
-                            
+                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
+                                    first_epoch = Some(msm_epoch);
+                                }
+
+                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
+                                    last_epoch = Some(msm_epoch);
+                                }
+
                                 let mut buff:[u8; 1200] = [0;1200];
 
                                 let mut i = 0;
@@ -434,7 +438,7 @@ pub fn convert_file(file_path:&String) {
                                                     Observable::Doppler("D5Q".to_string()),
                                                     Observable::SSI("S5Q".to_string())].to_vec());  
     
-        let header_fields = HeaderFields {crinex : None, time_of_first_obs: None, time_of_last_obs: None, codes:codes, clock_offset_applied: false, scaling: scaling};
+        let header_fields = HeaderFields {crinex : None, time_of_first_obs: first_epoch, time_of_last_obs: last_epoch, codes:codes, clock_offset_applied: false, scaling: scaling};
 
         let header : Header = Header::basic_obs();
         let header_obs = header.with_version(Version::new(3, 0)).with_observation_fields(header_fields);
