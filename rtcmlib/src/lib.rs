@@ -1,7 +1,8 @@
 #![allow(warnings)] 
 
 use std::{  collections::{BTreeMap, HashMap}, fs::{File}, io::{Read} };
-use rinex::{observation::{ Crinex, HeaderFields, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
+use hifitime::{Duration, Unit};
+use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
 
 use rtcm_rs::{msg::{Msg1077T, Msg1097Data, Msg1097T, Msm57Sat}, Message, MsgFrameIter};
 
@@ -39,6 +40,8 @@ const FREQ1_CMP:f64 = 1.561098e9;          /* BDS B1I     frequency (Hz) */
 const FREQ2_CMP:f64 = 1.20714e9;           /* BDS B2I/B2b frequency (Hz) */
 const FREQ3_CM:f64 = 1.26852e9;          /* BDS B3      frequency (Hz) */
 
+const DEFAULT_LLI:u16 = 0;
+
 struct Msm7Data {
 
     constellation:Constellation, 
@@ -51,8 +54,166 @@ struct Msm7Data {
     fine_pseudo_range:Option<f64>, 
     fine_phase_range:Option<f64>, 
     fine_phase_range_rate:Option<f64>, 
-    cnr:Option<f64>
+    cnr:Option<f64>,
+    loss_of_lock_indicator:u16,
+    half_cycle_ambiguity:u8
 }
+
+pub struct LockStatus {
+    use_rtklib_method:bool,
+    previous_lli:HashMap<SV, u16>,
+    previous_epoch:HashMap<SV, Epoch>
+}
+
+impl LockStatus {
+    pub fn new(use_rtklib_method:bool) -> LockStatus {
+        LockStatus { use_rtklib_method:use_rtklib_method, previous_lli: HashMap::new(), previous_epoch:HashMap::new()}
+    }
+    
+    /// Calculates the minimum lock time (t) based on the indicator value (i).
+    /// # Arguments
+    /// * `i` - The indicator value from DF407.
+    /// # Returns
+    /// * The minimum lock time in milliseconds.
+    fn calculate_minimum_lock_time(i: u16) -> u64 {
+        let i = i as u64;
+        match i {
+            0..=63 => i,
+            64..=95 => (2 * i - 64),
+            96..=127 => (4 * i - 256),
+            128..=159 => (8 * i - 768),
+            160..=191 => (16 * i - 2048),
+            192..=223 => (32 * i - 5120),
+            224..=255 => (64 * i - 12288),
+            256..=287 => (128 * i - 28672),
+            288..=319 => (256 * i - 65536),
+            320..=351 => (512 * i - 147456),
+            352..=383 => (1024 * i - 327680),
+            384..=415 => (2048 * i - 720896),
+            416..=447 => (4096 * i - 1572864),
+            448..=479 => (8192 * i - 3407872),
+            480..=511 => (16384 * i - 7340032),
+            512..=543 => (32768 * i - 15728640),
+            544..=575 => (65536 * i - 33554432),
+            576..=607 => (131072 * i - 71303168),
+            608..=639 => (262144 * i - 150994944),
+            640..=671 => (524288 * i - 318767104),
+            672..=703 => (1048576 * i - 671088640),
+            704 => (2097152 * i - 1409286144),
+            _ => 0, // Reserved or out of range
+        }
+    }
+
+    /// Returns the supplementary coefficient k based on the indicator value i.
+    /// # Arguments
+    /// * `i` - The indicator value from DF407.
+    /// # Returns
+    /// * The supplementary coefficient k.
+    /// Returns the supplementary coefficient k based on the indicator value i.
+    /// # Arguments
+    /// * `i` - The indicator value from DF407.
+    /// # Returns
+    /// * The supplementary coefficient k.
+    fn get_lli_coefficient(i: u16) -> u32 {
+        let i = i as u32;
+        match i {
+            0..=63 => 1,
+            64..=95 => 2,
+            96..=127 => 4,
+            128..=159 => 8,
+            160..=191 => 16,
+            192..=223 => 32,
+            224..=255 => 64,
+            256..=287 => 128,
+            288..=319 => 256,
+            320..=351 => 512,
+            352..=383 => 1024,
+            384..=415 => 2048,
+            416..=447 => 4096,
+            448..=479 => 8192,
+            480..=511 => 16384,
+            512..=543 => 32768,
+            544..=575 => 65536,
+            576..=607 => 131072,
+            608..=639 => 262144,
+            640..=671 => 524288,
+            672..=703 => 1048576,
+            704 => 2097152,
+            _ => 0, // Reserved or out of range
+        }
+    }
+
+    pub fn update_lock_status(&mut self, sv:&SV, current_epoch:&Epoch, current_lli:u16, half_cycle_ambiguity:u8) -> Option<LliFlags> {
+       
+        let mut lli = LliFlags::OK_OR_UNKNOWN;
+
+        if half_cycle_ambiguity > 0 {
+            // if half cycle slip possible 
+            lli |= LliFlags::HALF_CYCLE_SLIP;
+        }
+
+        let previous_lli = *self.previous_lli.get(sv).unwrap_or(&DEFAULT_LLI);
+        
+        if self.use_rtklib_method {
+
+            // uses RTKLIB's simplified method for finding loss of lock
+            // if current lli indicator is lower than the previous flag loss
+
+            if (previous_lli == 0 && current_lli == 0) ||
+                (current_lli < previous_lli) {
+                    lli |= LliFlags::LOCK_LOSS;
+            }
+        }
+        else {
+
+            /// Determines if there is a loss of lock based on DF407 values and the calculated minimum lock times.
+            /// According to RTCM 10403.4 section 3.5.12.3.2 Lock Time Indicator
+
+            let previous_epoch = self.previous_epoch.get(sv);
+
+            let mut dt:u64 = 0;
+
+            if previous_epoch.is_some() {
+                dt = (*current_epoch - *previous_epoch.unwrap()).to_unit(Unit::Millisecond) as u64;
+            }
+
+            let p = LockStatus::calculate_minimum_lock_time(previous_lli);
+            let n = LockStatus::calculate_minimum_lock_time(current_lli);
+            let a: u32 = LockStatus::get_lli_coefficient(previous_lli);
+            let b = LockStatus::get_lli_coefficient(current_lli);
+
+            if p > n {
+                lli |= LliFlags::LOCK_LOSS;
+            } else if p == n && dt >= a as u64 {
+                lli |= LliFlags::LOCK_LOSS;
+            } else if p == n && dt < a as u64 {
+                lli |= LliFlags::OK_OR_UNKNOWN;
+            } else if p < n && b > p as u32 && dt >= (n + b as u64 - p) {
+                lli |= LliFlags::LOCK_LOSS;
+            } else if p < n && b > p as u32 && n < dt && dt < (n + b as u64 - p) {
+                lli |= LliFlags::LOCK_LOSS;
+            } else if p < n && b > p as u32 && dt <= n {
+                lli |= LliFlags::OK_OR_UNKNOWN;
+            } else if p < n && b <= p as u32 && dt > n {
+                lli |= LliFlags::LOCK_LOSS;
+            } else if p < n && b <= p as u32 && dt <= n {
+                lli |= LliFlags::OK_OR_UNKNOWN;
+            } else {
+                lli |= LliFlags::OK_OR_UNKNOWN;
+            }
+        }
+        
+
+        self.previous_lli.insert(*sv, current_lli);
+        self.previous_epoch.insert(*sv, *current_epoch);
+
+        return Some(lli);
+
+    }
+    
+}
+
+
 
 
 // constillation + code to frequency from RKTLIB:
@@ -98,7 +259,7 @@ fn get_frequency(constellation:Constellation, band:u8) -> f64 {
 // time conversion from GPS and Galileo time of week (ms) + GPS/Galileo week period
 // see RTKLIB for implementation reference: https://github.com/tomojitakasu/RTKLIB/blob/71db0ffa0d9735697c6adfd06fdf766d0e5ce807/src/rtkcmn.c#L1246
 
-fn rtcm_gps_time2epoch(tow_ms:f64, week:u64) -> Epoch {
+pub fn rtcm_gps_time2epoch(tow_ms:f64, week:u64) -> Epoch {
 
     let mut tow_sec = tow_ms / 1000.0;
 
@@ -111,7 +272,7 @@ fn rtcm_gps_time2epoch(tow_ms:f64, week:u64) -> Epoch {
     return t;
 }
 
-fn rtcm_galileo_time2epoch(tow_ms:f64, week:u64) -> Epoch {
+pub fn rtcm_galileo_time2epoch(tow_ms:f64, week:u64) -> Epoch {
     
     let mut tow_sec = tow_ms / 1000.0;
 
@@ -124,13 +285,16 @@ fn rtcm_galileo_time2epoch(tow_ms:f64, week:u64) -> Epoch {
     return t;
 }
 
+
+
 fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, ObservationData>>, 
-                    signal:Msm7Data)  {
+                    signal:Msm7Data, lock_status:&mut LockStatus, current_epoch:&Epoch)  {
                         
     let code_str = format!("{}{}", signal.band, signal.attribute);
 
     let frequency:f64 = get_frequency(signal.constellation, signal.band);
     let wavelength:f64 = frequency / C_LIGHT;
+
 
     // modeled on RKTLIB msm7 decoder 
     // see: https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtcm3.c#L1987
@@ -152,6 +316,9 @@ fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, Observati
     if signal.rough_range.is_some() {
         range = Some(((signal.rough_range.unwrap() as f64) * RANGE_MS) + (signal.rough_range_mod1ms  * RANGE_MS));
     }
+
+    let mut lli:Option<LliFlags> = lock_status.update_lock_status(&key, current_epoch, signal.loss_of_lock_indicator, signal.half_cycle_ambiguity);
+
    
     let mut rough_phase_range_rate:Option<f64> = None;
     if signal.rough_phase_range_rate.is_some()  {
@@ -190,7 +357,7 @@ fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, Observati
         let phase_range_obs =(range.unwrap() + fine_phase_range.unwrap()) * wavelength; 
         let code = Observable::Phase(format!("L{}", code_str));
         observation_data.insert(code, 
-                                ObservationData {obs:phase_range_obs, lli: None, snr: None});
+                                ObservationData {obs:phase_range_obs, lli: lli, snr: None});
     }
     
     if rough_phase_range_rate.is_some() && fine_phase_range_rate.is_some() {
@@ -210,9 +377,10 @@ fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, Observati
 }
 
 
-pub fn process_msm1077( msg:Msg1077T)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
+pub fn process_msm1077( msg:Msg1077T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
     
     let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
+    
                                 
     let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
         
@@ -231,19 +399,21 @@ pub fn process_msm1077( msg:Msg1077T)  -> BTreeMap<SV, HashMap<Observable, Obser
             rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
             rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
             rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
+            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
+            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
             fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
             fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
             fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
             cnr: signal.gnss_signal_cnr_ext_dbhz,
         };
 
-        process_signals(&mut observations, signal);
+        process_signals(&mut observations, signal, lock_status, current_epoch);
 
         i += 1;
         
         for a in observations.iter() {
             for b in a.1.iter() {
-                println!("   {} {}: {}", a.0, b.0, b.1.obs);
+                println!("   {} {}: {} ({:?})", a.0, b.0, b.1.obs, b.1.lli);
             }
         }
     }
@@ -252,7 +422,7 @@ pub fn process_msm1077( msg:Msg1077T)  -> BTreeMap<SV, HashMap<Observable, Obser
         
 }
 
-pub fn process_msm1097( msg:Msg1097T)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
+pub fn process_msm1097( msg:Msg1097T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
     
     let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
                                 
@@ -278,13 +448,16 @@ pub fn process_msm1097( msg:Msg1097T)  -> BTreeMap<SV, HashMap<Observable, Obser
             rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
             rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
             rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
+            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
+            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
             fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
             fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
             fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
-            cnr: signal.gnss_signal_cnr_ext_dbhz,
+            cnr: signal.gnss_signal_cnr_ext_dbhz
+            
         };
 
-        process_signals(&mut observations, signal);
+        process_signals(&mut observations, signal, lock_status, current_epoch);
 
         i += 1;
         
@@ -311,11 +484,18 @@ pub fn convert_file(file_path:&String) {
         let mut rinex_data : BTreeMap<(Epoch, EpochFlag), (Option<f64>, BTreeMap<SV, HashMap<Observable, ObservationData>>)> = BTreeMap::new();
         let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
 
-        let mut gps_week:Option<u64>  = None;
-        let mut galileo_week:Option<u64>  = None;
+   
+        //         converting rtcm file: data_trace/2024-10-03_17-32-47.pi4.rtcm.log
+        // galileo week: 1310
+        // gps week: 2334
+
+        let mut gps_week:Option<u64>  = Some(2334);
+        let mut galileo_week:Option<u64>  = Some(1310);
 
         let mut first_epoch:Option<Epoch> = None;
         let mut last_epoch:Option<Epoch> = None;
+
+        let mut lock_status:LockStatus = LockStatus::new(false);
 
         for message_frame in &mut iterator {
             if message_frame.message_number().is_some() {
@@ -326,12 +506,14 @@ pub fn convert_file(file_path:&String) {
                         // gps ephemeris 
                         Message::Msg1019(msg1019) => {
                             // TODO handle GPS week rollover correctly
-                            gps_week = Some(msg1019.gps_week_number as u64 + 1024 + 1024);              
+                            gps_week = Some(msg1019.gps_week_number as u64 + 1024 + 1024);   
+                            println!("gps week: {}", gps_week.unwrap());
                         }
 
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
                         Message::Msg1046(msg1046) => {
                             galileo_week = Some(msg1046.gal_week_number as u64);  
+                            println!("galileo week: {}", galileo_week.unwrap());
                         }
                         
                         // gps msm7 
@@ -359,7 +541,7 @@ pub fn convert_file(file_path:&String) {
                                     i += 1;
                                 }
 
-                                let mut observations = process_msm1077(msg1077);
+                                let mut observations = process_msm1077(msg1077, &mut lock_status,&msm_epoch);
 
                                 if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
                                     rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
@@ -397,7 +579,7 @@ pub fn convert_file(file_path:&String) {
                                     i += 1;
                                 }
 
-                                let mut observations = process_msm1097(msg1097);
+                                let mut observations = process_msm1097(msg1097, &mut lock_status, &msm_epoch);
 
                                 if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
                                     rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);

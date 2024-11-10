@@ -6,10 +6,11 @@ use std::{fs::File, io::Read, mem::MaybeUninit, ptr::addr_of_mut};
 use clap::builder::Str;
 use cty::uint16_t;
 use float_cmp::approx_eq;
+use rinex::observation::LliFlags;
 use rtcm_rs::{msg, Message, MsgFrameIter};
 use rtklib_sys::rtklib::{self, decode_msm7, obsd_t, rtcm_t};
 use rinex::{observation::{ HeaderFields, ObservationData}};
-use rtcmlib::{process_msm1077, process_msm1097};
+use rtcmlib::{process_msm1077, process_msm1097, rtcm_galileo_time2epoch, rtcm_gps_time2epoch, LockStatus};
 use rtcmlib::prelude::{SV,Constellation, Observable};
 
 
@@ -48,7 +49,29 @@ fn compare(rtklib_obs:&obsd_t, rtcmlib_observations:&BTreeMap<SV, HashMap<Observ
                 if rtcm_l_opt.is_some() {
                     let rtk_val = rtklib_obs.L[i];
                     let rtcm_val = rtcm_l_opt.unwrap().obs;
-                    assert!(approx_eq!(f64, rtk_val, rtcm_val));                                            
+                    assert!(approx_eq!(f64, rtk_val, rtcm_val));  
+
+
+                    let rtk_lli_val = rtklib_obs.LLI[i];
+                    let rtcm_lli_val = rtcm_l_opt.unwrap().lli;
+
+                    match rtcm_lli_val {
+                        None => {
+                            assert_eq!(rtk_lli_val, 0);     
+                        }
+                        Some(LliFlags::OK_OR_UNKNOWN) => {
+                            assert_eq!(rtk_lli_val, 0);     
+                        }
+                        Some(LliFlags::LOCK_LOSS) => {
+                            assert_eq!(rtk_lli_val, 1);     
+                        }
+                        Some(LliFlags::HALF_CYCLE_SLIP) => {
+                            assert_eq!(rtk_lli_val, 3);     
+                        }
+                        _ => {
+                            panic!("Unhandled LLI test case");
+                        }
+                    }                                       
                 }
                 else if rtklib_obs.L[i] != 0.0 {
                     assert!(false, "missing rtcmlib observation");
@@ -95,15 +118,36 @@ fn process_rtcm_1077() {
 
     let mut rtcm_buffer = Vec::<u8>::new();
 
+    let mut lock_status:LockStatus = LockStatus::new(false);
+
     if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
 
         let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
 
+        let mut gps_week:Option<u64>  = Some(2334);
+        let mut galileo_week:Option<u64>  = Some(1310);
+
         for message_frame in &mut iterator {
             match message_frame.get_message() {
+                
+                  // gps ephemeris 
+                Message::Msg1019(msg1019) => {
+                    // TODO handle GPS week rollover correctly
+                    gps_week = Some(msg1019.gps_week_number as u64 + 1024 + 1024);   
+                    println!("gps week: {}", gps_week.unwrap());
+                }
+
+                // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
+                Message::Msg1046(msg1046) => {
+                    galileo_week = Some(msg1046.gal_week_number as u64);  
+                    println!("galileo week: {}", galileo_week.unwrap());
+                }
 
                 // gps 
                 Message::Msg1077(msg1077) => {
+
+                    let time = msg1077.gps_epoch_time_ms as f64;
+                    let msm_epoch = rtcm_gps_time2epoch(time, gps_week.unwrap());
 
                     unsafe { 
                         
@@ -129,7 +173,7 @@ fn process_rtcm_1077() {
                         decode_msm7(rtcm.as_mut_ptr(), 0x01);
 
                         // calc rtcmlib values
-                        let rtcmlib_observations = process_msm1077(msg1077);
+                        let rtcmlib_observations = process_msm1077(msg1077, &mut lock_status, &msm_epoch);
 
                         let mut obs_stats = 0;
                         let rtk = rtklib_observations.assume_init();
@@ -148,6 +192,9 @@ fn process_rtcm_1077() {
                 // galileo  
                 Message::Msg1097(msg1097) => {
                     println!("{}", message_frame.message_number().unwrap());
+
+                    let time = msg1097.gal_epoch_time_ms as f64;
+                    let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
                     unsafe { 
                         let mut rtcm:MaybeUninit<rtcm_t> = MaybeUninit::zeroed();
@@ -172,7 +219,7 @@ fn process_rtcm_1077() {
                         decode_msm7(rtcm.as_mut_ptr(), 0x08);
 
                         // calc rtcmlib values
-                        let rtcmlib_observations = process_msm1097(msg1097);
+                        let rtcmlib_observations = process_msm1097(msg1097, &mut lock_status, &msm_epoch);
 
                         let mut obs_stats = 0;
                         for rtklib_obs in rtklib_observations.assume_init() {
