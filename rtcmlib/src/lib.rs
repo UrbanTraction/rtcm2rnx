@@ -1,6 +1,7 @@
 #![allow(warnings)] 
+#![feature(hash_extract_if)]
 
-use std::{  collections::{BTreeMap, HashMap}, fs::{File}, io::{Read} };
+use std::{  collections::{BTreeMap, HashMap, HashSet}, fmt, fs::File, io::Read, task::Context };
 use hifitime::{Duration, Unit};
 use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
 
@@ -467,6 +468,18 @@ pub fn process_msm1097( msg:Msg1097T, lock_status:&mut LockStatus, current_epoch
         
 }
 
+fn extract_observed_signals(obs_data:&BTreeMap<SV, HashMap<Observable, ObservationData>>, observed_signals:&mut HashSet<(Constellation, String)>) {
+
+    for sv in obs_data.keys() {
+        let constellation = sv.constellation;
+        let observations = obs_data.get(&sv).unwrap();
+        for observable in observations.keys() {
+            let code = observable.code().unwrap();
+            observed_signals.insert((constellation, code));
+        }   
+    }
+}
+
 pub fn convert_file(file_path:&String) {
     
     println!("converting rtcm file: {}", file_path);
@@ -496,6 +509,8 @@ pub fn convert_file(file_path:&String) {
         let mut last_epoch:Option<Epoch> = None;
 
         let mut lock_status:LockStatus = LockStatus::new(false);
+
+        let mut observed_signals: HashSet<(Constellation, String)> = HashSet::new();
 
         for message_frame in &mut iterator {
             if message_frame.message_number().is_some() {
@@ -543,6 +558,8 @@ pub fn convert_file(file_path:&String) {
 
                                 let mut observations = process_msm1077(msg1077, &mut lock_status,&msm_epoch);
 
+                                extract_observed_signals(&observations, &mut observed_signals); 
+
                                 if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
                                     rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
                                 
@@ -581,6 +598,8 @@ pub fn convert_file(file_path:&String) {
 
                                 let mut observations = process_msm1097(msg1097, &mut lock_status, &msm_epoch);
 
+                                extract_observed_signals(&observations, &mut observed_signals); 
+
                                 if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
                                     rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
                                 
@@ -602,24 +621,37 @@ pub fn convert_file(file_path:&String) {
 
         let mut codes:HashMap<Constellation, Vec<Observable>> = HashMap::new();
 
-        codes.insert(Constellation::GPS, [Observable::PseudoRange("C1C".to_string()),
-                                                Observable::Phase("L1C".to_string()),
-                                                Observable::Doppler("D1C".to_string()),
-                                                Observable::SSI("S1C".to_string()),
-                                                Observable::PseudoRange("C5Q".to_string()),
-                                                Observable::Phase("L5Q".to_string()),
-                                                Observable::Doppler("D5Q".to_string()),
-                                                Observable::SSI("S5Q".to_string())].to_vec());            
+        let mut gps_codes:Vec<String> = observed_signals.extract_if(|c|c.0 == Constellation::GPS).map(|c: (Constellation, String)|c.1).collect();
+        gps_codes.sort();
 
-        codes.insert(Constellation::Galileo, [Observable::PseudoRange("C1C".to_string()),
-                                                    Observable::Phase("L1C".to_string()),
-                                                    Observable::Doppler("D1C".to_string()),
-                                                    Observable::SSI("S1C".to_string()),
-                                                    Observable::PseudoRange("C5Q".to_string()),
-                                                    Observable::Phase("L5Q".to_string()),
-                                                    Observable::Doppler("D5Q".to_string()),
-                                                    Observable::SSI("S5Q".to_string())].to_vec());  
-    
+
+        let mut gps_observables:Vec<Observable> = Vec::new();
+
+        for code in gps_codes.iter() {
+            gps_observables.push(Observable::PseudoRange(format!("C{}", code)));
+            gps_observables.push(Observable::Phase(format!("L{}", code)));
+            gps_observables.push(Observable::Doppler(format!("D{}", code)));
+            gps_observables.push(Observable::SSI(format!("S{}", code)));
+        }
+
+        codes.insert(Constellation::GPS, gps_observables);
+
+        let mut galileo_codes:Vec<String> = observed_signals.extract_if(|c|c.0 == Constellation::Galileo).map(|c: (Constellation, String)|c.1).collect();
+        galileo_codes.sort();
+
+        let mut galileo_observables:Vec<Observable> = Vec::new();
+
+        for code in galileo_codes.iter() {
+
+            galileo_observables.push(Observable::PseudoRange(format!("C{}", code)));
+            galileo_observables.push(Observable::Phase(format!("L{}", code)));
+            galileo_observables.push(Observable::Doppler(format!("D{}", code)));
+            galileo_observables.push(Observable::SSI(format!("S{}", code)));
+
+        }
+
+        codes.insert(Constellation::Galileo, galileo_observables);
+          
         let header_fields = HeaderFields {crinex : None, time_of_first_obs: first_epoch, time_of_last_obs: last_epoch, codes:codes, clock_offset_applied: false, scaling: scaling};
 
         let header : Header = Header::basic_obs();
