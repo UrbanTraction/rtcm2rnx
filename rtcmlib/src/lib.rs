@@ -59,8 +59,8 @@ struct MsmData {
 
 pub struct LockStatus {
     use_rtklib_method:bool,
-    previous_lli:HashMap<SV, u16>,
-    previous_epoch:HashMap<SV, Epoch>
+    previous_lli:HashMap<(SV, String), u16>,
+    previous_epoch:HashMap<(SV, String), Epoch>
 }
 
 impl LockStatus {
@@ -141,16 +141,18 @@ impl LockStatus {
         }
     }
 
-    pub fn update_lock_status(&mut self, sv:&SV, current_epoch:&Epoch, current_lli:u16, half_cycle_ambiguity:u8) -> Option<LliFlags> {
+    pub fn update_lock_status(&mut self, sv:&SV, code:&String, current_epoch:&Epoch, current_lli:u16, half_cycle_ambiguity:u8) -> Option<LliFlags> {
        
         let mut lli = LliFlags::OK_OR_UNKNOWN;
+
+        let lock_key = &(*sv, code.clone());
 
         if half_cycle_ambiguity > 0 {
             // if half cycle slip possible 
             lli |= LliFlags::HALF_CYCLE_SLIP;
         }
 
-        let previous_lli = *self.previous_lli.get(sv).unwrap_or(&DEFAULT_LLI);
+        let previous_lli = *self.previous_lli.get(&lock_key).unwrap_or(&DEFAULT_LLI);
         
         if self.use_rtklib_method {
 
@@ -167,7 +169,7 @@ impl LockStatus {
             /// Determines if there is a loss of lock based on DF407 values and the calculated minimum lock times.
             /// According to RTCM 10403.4 section 3.5.12.3.2 Lock Time Indicator
 
-            let previous_epoch = self.previous_epoch.get(sv);
+            let previous_epoch = self.previous_epoch.get(lock_key);
 
             let mut dt:u64 = 0;
 
@@ -202,8 +204,8 @@ impl LockStatus {
         }
         
 
-        self.previous_lli.insert(*sv, current_lli);
-        self.previous_epoch.insert(*sv, *current_epoch);
+        self.previous_lli.insert(lock_key.clone(), current_lli);
+        self.previous_epoch.insert(lock_key.clone(), *current_epoch);
 
         return Some(lli);
 
@@ -315,7 +317,7 @@ fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, Observati
         range = Some(((signal.rough_range.unwrap() as f64) * RANGE_MS) + (signal.rough_range_mod1ms  * RANGE_MS));
     }
 
-    let mut lli:Option<LliFlags> = lock_status.update_lock_status(&key, current_epoch, signal.loss_of_lock_indicator, signal.half_cycle_ambiguity);
+    let mut lli:Option<LliFlags> = lock_status.update_lock_status(&key, &code_str, current_epoch, signal.loss_of_lock_indicator, signal.half_cycle_ambiguity);
 
    
     let mut rough_phase_range_rate:Option<f64> = None;

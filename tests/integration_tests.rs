@@ -27,6 +27,8 @@ const OBS_CODES:[&str;70]=[       /* observation code strings */
 
 fn compare(rtklib_obs:&obsd_t, rtcmlib_observations:&BTreeMap<SV, HashMap<Observable, ObservationData>>, sv:SV) {
     let rtcmlib_obs = rtcmlib_observations.get(&sv);
+
+    let l = LliFlags::HALF_CYCLE_SLIP | LliFlags::LOCK_LOSS;
     if rtcmlib_obs.is_some() {
         // rtklib packs three channel observations into each osdb_t struct
         for i in [0,1,2] {
@@ -66,6 +68,9 @@ fn compare(rtklib_obs:&obsd_t, rtcmlib_observations:&BTreeMap<SV, HashMap<Observ
                             assert_eq!(rtk_lli_val, 1);     
                         }
                         Some(LliFlags::HALF_CYCLE_SLIP) => {
+                            assert_eq!(rtk_lli_val, 2);     
+                        }
+                        Some(l) => {
                             assert_eq!(rtk_lli_val, 3);     
                         }
                         _ => {
@@ -118,7 +123,7 @@ fn process_rtcm_1077() {
 
     let mut rtcm_buffer = Vec::<u8>::new();
 
-    let mut lock_status:LockStatus = LockStatus::new(false);
+    let mut lock_status:LockStatus = LockStatus::new(true);
 
     if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
 
