@@ -3,3 +3,4 @@ Cargo.lock
 /data/
 /data_trace/
 .vscode
+.DS_Store

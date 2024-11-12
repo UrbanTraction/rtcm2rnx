@@ -581,7 +581,7 @@ fn extract_observed_signals(obs_data:&BTreeMap<SV, HashMap<Observable, Observati
     }
 }
 
-pub fn convert_file(file_path:&String) {
+pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
     
     println!("converting rtcm file: {}", file_path);
     let mut rtcm_file = File::open(file_path).expect(format!("Unable to open file: {}", file_path).as_str());
@@ -599,7 +599,7 @@ pub fn convert_file(file_path:&String) {
         let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
 
    
-        //         converting rtcm file: data_trace/2024-10-03_17-32-47.pi4.rtcm.log
+        // converting rtcm file: data_trace/2024-10-03_17-32-47.pi4.rtcm.log
         // galileo week: 1310
         // gps week: 2334
 
@@ -609,7 +609,7 @@ pub fn convert_file(file_path:&String) {
         let mut first_epoch:Option<Epoch> = None;
         let mut last_epoch:Option<Epoch> = None;
 
-        let mut lock_status:LockStatus = LockStatus::new(false);
+        let mut lock_status:LockStatus = LockStatus::new(use_rtklib_lli);
 
         let mut observed_signals: HashSet<(Constellation, String)> = HashSet::new();
 
@@ -672,7 +672,6 @@ pub fn convert_file(file_path:&String) {
                             }
                             
                         }      
-
 
                         // gps msm7 
                         Message::Msg1077(msg1077) => {
@@ -843,7 +842,16 @@ pub fn convert_file(file_path:&String) {
         let record = rinex::record::Record::ObsRecord(rinex_data);
         let rinex = Rinex::new(header_obs, record);
 
-        let rnx_path = format!("{}.rnx", file_path);
+
+        let mut rnx_path;
+        
+        if use_rtklib_lli {
+            rnx_path = format!("{}.rtklib.rnx", file_path);
+        }
+        else {
+            rnx_path = format!("{}.rnx", file_path);
+        }
+        
         rinex.to_file(&rnx_path).expect("unable to write file");
 
         println!("complete! RINEX file output: {}", rnx_path);

@@ -1,4 +1,4 @@
-use clap::{Arg, Command, };
+use clap::{value_parser, Arg, Command };
 use rtcmlib::convert_file;
 
 // cli interface
@@ -12,6 +12,12 @@ fn command() -> clap::Command {
         .subcommand(
             Command::new("convert")
                 .about("converts an input file")
+                .arg(
+                    Arg::new("use-rtklib-lli")
+                        .long("use-rtklib-lli")
+                        .help("Use the simplifed rtklib lli algo (for diagnostics only)")
+                        .value_parser(value_parser!(bool))
+                        .default_value("false"))
                 .arg(
                     Arg::new("file_path")
                         .help("Log file input")
@@ -32,7 +38,8 @@ fn main() {
 
         Some(("convert", client_matches)) => {
             let file_path = client_matches.get_one::<String>("file_path").unwrap();
-            convert_file(file_path);
+            let use_rtklib_lli= client_matches.get_one::<bool>("use-rtklib-lli").unwrap();
+            convert_file(file_path, *use_rtklib_lli);
         }
 
         _ => {

@@ -123,7 +123,7 @@ fn process_rtcm_1077() {
 
     let mut rtcm_buffer = Vec::<u8>::new();
 
-    let mut lock_status:LockStatus = LockStatus::new(true);
+    let mut lock_status:LockStatus = LockStatus::new(false);
 
     if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
 
