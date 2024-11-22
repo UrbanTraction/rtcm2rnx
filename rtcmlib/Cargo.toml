@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hifitime = "4.0.0-alpha"
-rinex = "^0.17.0-alpha-1"
+hifitime = "4.0.0-beta"
+rinex = { version = "^0.17.0-alpha-1", path = "../../rinex/rinex", features=["full"]}
 rtcm-rs = "0.11.0"

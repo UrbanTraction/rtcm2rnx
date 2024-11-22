@@ -6,9 +6,10 @@ git-fetch-with-cli = true
 
 [dependencies]
 build = "0.0.2"
-cargo = "0.82.0"
 clap = "4.5.17"
 cty = "0.2.2"
+rinex = { git = "https://github.com/georust/rinex", features=["full"]}
+#{ version = "^0.17.0-alpha-1", path = "../rinex/rinex", features=["full"]}
 rtcmlib = { version = "0.1.0", path = "rtcmlib" }
 
 
@@ -16,5 +17,6 @@ rtcmlib = { version = "0.1.0", path = "rtcmlib" }
 rtklib-sys = { git = "https://github.com/kpwebb/rtklib-ffi.git", version ="0.1.3" }
 rtcm-rs = "0.11.0"
 float-cmp = "0.10.0"
-rinex = "^0.17.0-alpha-1"
+rinex = { git = "https://github.com/georust/rinex", features=["full"]}
+#= { version = "^0.17.0-alpha-1", path = "../rinex/rinex", features=["full"]}
 

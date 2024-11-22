@@ -441,7 +441,7 @@ pub fn process_msm1077( msg:Msg1077T, lock_status:&mut LockStatus, current_epoch
 
     let mut i = 0;
     for signal in msg.data_segment.signal_data.iter() {
-    
+        
         let signal:MsmData  = MsmData {
             constellation: Constellation::GPS, 
             satellite_id: signal.satellite_id, 
