@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 hifitime = "4.0.0-beta"
-rinex = { version = "^0.17.0-alpha-1", path = "../../rinex/rinex", features=["full"]}
+log = "0.4.22"
+rinex = { git = "https://github.com/georust/rinex", features=["full"]}
 rtcm-rs = "0.11.0"

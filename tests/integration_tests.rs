@@ -1,5 +1,6 @@
 #![allow(warnings)] 
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::option::Iter;
 use std::{fs::File, io::Read, mem::MaybeUninit, ptr::addr_of_mut};
@@ -7,10 +8,11 @@ use clap::builder::Str;
 use cty::uint16_t;
 use float_cmp::approx_eq;
 use rinex::observation::LliFlags;
+use rinex::prelude::EpochFlag;
 use rtcm_rs::{msg, Message, MsgFrameIter};
 use rtklib_sys::rtklib::{self, decode_msm7, obsd_t, rtcm_t};
 use rinex::{observation::{ HeaderFields, ObservationData}};
-use rtcmlib::{process_msm1077, process_msm1097, rtcm_galileo_time2epoch, rtcm_gps_time2epoch, LockStatus};
+use rtcmlib::{rtcm_galileo_time2epoch, rtcm_gps_time2epoch, LockStatus, RtcmDecoder};
 use rtcmlib::prelude::{SV,Constellation, Observable};
 
 
@@ -115,7 +117,7 @@ fn compare(rtklib_obs:&obsd_t, rtcmlib_observations:&BTreeMap<SV, HashMap<Observ
 }
 
 #[test]
-fn process_rtcm_1077() {
+fn process_rtcm() {
     // let ref mut cool = CoolStruct {x: 0, y: 0};
     let file_path = "tests/data/debug.rtcm";
     // unsafe { cool_function(2, 6, cool) }
@@ -123,7 +125,8 @@ fn process_rtcm_1077() {
 
     let mut rtcm_buffer = Vec::<u8>::new();
 
-    let mut lock_status:LockStatus = LockStatus::new(false);
+    //let mut lock_status:LockStatus = LockStatus::new(false);
+    let mut rtcm_decoder= RtcmDecoder::new(true);
 
     if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
 
@@ -178,7 +181,7 @@ fn process_rtcm_1077() {
                         decode_msm7(rtcm.as_mut_ptr(), 0x01);
 
                         // calc rtcmlib values
-                        let rtcmlib_observations = process_msm1077(msg1077, &mut lock_status, &msm_epoch);
+                        let rtcmlib_observations = rtcm_decoder.process_msm1077(msg1077, msm_epoch);
 
                         let mut obs_stats = 0;
                         let rtk = rtklib_observations.assume_init();
@@ -188,7 +191,9 @@ fn process_rtcm_1077() {
                                 // rtklib gps sat no aligns with prn -- sat no for other constellations aren't the same as prn 
                                 let sv = SV {prn: rtklib_obs.sat , constellation:Constellation::GPS};
 
-                                compare(&rtklib_obs, &rtcmlib_observations, sv);
+                                let rtcm_data = rtcm_decoder.get_rtcm_data();
+                                let epoch_data = rtcm_data.get(&(msm_epoch, EpochFlag::Ok)).unwrap().1.borrow();
+                                compare(&rtklib_obs, epoch_data, sv);
                             }
                         }   
                     }
@@ -196,8 +201,7 @@ fn process_rtcm_1077() {
 
                 // galileo  
                 Message::Msg1097(msg1097) => {
-                    println!("{}", message_frame.message_number().unwrap());
-
+                    
                     let time = msg1097.gal_epoch_time_ms as f64;
                     let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
@@ -224,7 +228,7 @@ fn process_rtcm_1077() {
                         decode_msm7(rtcm.as_mut_ptr(), 0x08);
 
                         // calc rtcmlib values
-                        let rtcmlib_observations = process_msm1097(msg1097, &mut lock_status, &msm_epoch);
+                        let rtcmlib_observations = rtcm_decoder.process_msm1097(msg1097, msm_epoch);
 
                         let mut obs_stats = 0;
                         for rtklib_obs in rtklib_observations.assume_init() {
@@ -238,7 +242,9 @@ fn process_rtcm_1077() {
                                 obs_stats += 1;
                                 let sv = SV {prn: galileo_sat_no , constellation:Constellation::Galileo};
 
-                                compare(&rtklib_obs, &rtcmlib_observations, sv);
+                                let rtcm_data = rtcm_decoder.get_rtcm_data();
+                                let epoch_data = rtcm_data.get(&(msm_epoch, EpochFlag::Ok)).unwrap().1.borrow();
+                                compare(&rtklib_obs, epoch_data, sv);
                             }
                         }   
                     }

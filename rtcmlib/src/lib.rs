@@ -1,11 +1,15 @@
 #![allow(warnings)] 
-#![feature(hash_extract_if)]
 
-use std::{  collections::{BTreeMap, HashMap, HashSet}, fmt, fs::File, io::Read, task::Context };
+use std::{  borrow::{Borrow, BorrowMut}, collections::{BTreeMap, HashMap, HashSet}, fmt, fs::File, io::Read, path::Path, task::Context };
 use hifitime::{Duration, Unit};
-use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData}, prelude::{Constellation, Epoch, EpochFlag, Header, Observable, SV}, version::Version, Rinex};
+use log::info;
+use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData, EpochFlag}, prelude::{Constellation, Epoch, Header, Observable, SV}, version::Version, Rinex};
 
 use rtcm_rs::{msg::{Msg1074T, Msg1077T, Msg1094T, Msg1097Data, Msg1097T, Msm46Sat, Msm57Sat}, Message, MsgFrameIter};
+
+
+// epoch/sv/observation map for data extracted from rtcm log 
+pub type RtcmData = BTreeMap<(Epoch, EpochFlag), (Option<f64>, BTreeMap<SV, HashMap<Observable, ObservationData>>)>;
 
 pub mod prelude {
     pub use rinex::prelude::{Constellation, SV, Observable};
@@ -287,334 +291,323 @@ pub fn rtcm_galileo_time2epoch(tow_ms:f64, week:u64) -> Epoch {
 
 
 
-fn process_signals( observations:&mut BTreeMap<SV, HashMap<Observable, ObservationData>>, 
-                    signal:MsmData, lock_status:&mut LockStatus, current_epoch:&Epoch)  {
-                        
-    let code_str = format!("{}{}", signal.band, signal.attribute);
 
-    let frequency:f64 = get_frequency(signal.constellation, signal.band);
-    let wavelength:f64 = frequency / C_LIGHT;
-
-
-    // modeled on RKTLIB msm7 decoder 
-    // see: https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtcm3.c#L1987
-
-    let observation_data:&mut HashMap<Observable, ObservationData>;
-
-    let key = SV {constellation:signal.constellation, prn: signal.satellite_id};
-
-    if observations.contains_key(&key) {
-        observation_data = observations.get_mut(&key).unwrap();
-    }   
-    else {
-        let observation_data_original = HashMap::new();
-        observations.insert(key, observation_data_original);
-        observation_data = observations.get_mut(&key).unwrap();                                                
-    }
-
-    let mut range:Option<f64>  = None;
-    if signal.rough_range.is_some() {
-        range = Some(((signal.rough_range.unwrap() as f64) * RANGE_MS) + (signal.rough_range_mod1ms  * RANGE_MS));
-    }
-
-    let mut lli:Option<LliFlags> = lock_status.update_lock_status(&key, &code_str, current_epoch, signal.loss_of_lock_indicator, signal.half_cycle_ambiguity);
-
-   
-    let mut rough_phase_range_rate:Option<f64> = None;
-    if signal.rough_phase_range_rate.is_some()  {
-        rough_phase_range_rate = Some(signal.rough_phase_range_rate.unwrap() as f64);
-    } 
-    
-    let mut fine_phase_range_rate:Option<f64> = None;
-    if signal.fine_phase_range_rate.is_some() {
-        fine_phase_range_rate = signal.fine_phase_range_rate;
-    }
-    
-    let mut fine_pseudo_range:Option<f64> = None;
-    if signal.fine_pseudo_range.is_some() {
-        fine_pseudo_range =  Some((signal.fine_pseudo_range.unwrap() as f64)  * RANGE_MS);
-    }     
-
-    let mut fine_pseudo_range:Option<f64> = None;
-    if signal.fine_pseudo_range.is_some() {
-        fine_pseudo_range = Some((signal.fine_pseudo_range.unwrap() as f64)  * RANGE_MS);
-    }
-
-    let mut fine_phase_range:Option<f64> = None;
-    if signal.fine_phase_range.is_some() {
-        fine_phase_range = Some((signal.fine_phase_range.unwrap() as f64)  * RANGE_MS);
-    }
-    
-    
-    if range.is_some() && fine_pseudo_range.is_some() {
-        let pseudo_range_obs = (range.unwrap() + fine_pseudo_range.unwrap());
-        let code = Observable::PseudoRange(format!("C{}", code_str));
-        observation_data.insert(code, 
-                                ObservationData {obs:pseudo_range_obs, lli: None, snr: None});
-    }
-   
-    if range.is_some() && fine_phase_range.is_some() {
-        let phase_range_obs =(range.unwrap() + fine_phase_range.unwrap()) * wavelength; 
-        let code = Observable::Phase(format!("L{}", code_str));
-        observation_data.insert(code, 
-                                ObservationData {obs:phase_range_obs, lli: lli, snr: None});
-    }
-    
-    if rough_phase_range_rate.is_some() && fine_phase_range_rate.is_some() {
-        let phase_range_rate_obs:f64 = (-(rough_phase_range_rate.unwrap() + fine_phase_range_rate.unwrap())) * wavelength;
-        let code = Observable::Doppler(format!("D{}", code_str));
-        observation_data.insert(code, 
-                                ObservationData {obs:phase_range_rate_obs, lli: None, snr: None});
-    }
-    
-    if signal.cnr.is_some() {
-        let cnr_obs = (signal.cnr.unwrap() as f64);
-        let code = Observable::SSI(format!("S{}", code_str));
-        observation_data.insert(code, 
-                                ObservationData {obs:cnr_obs, lli: None, snr: None});
-    }
-
+pub struct RtcmDecoder {
+    first_epoch:Option<Epoch>,
+    last_epoch:Option<Epoch>,
+    rtcm_data:RtcmData,
+    lock_status:LockStatus
 }
 
 
-pub fn process_msm1074( msg:Msg1074T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
-    
-    let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
-                                
-    let mut satellites:HashMap<u8,&Msm46Sat>  = HashMap::new();
-        
-    for satellite in msg.data_segment.satellite_data.iter() {
-        satellites.insert(satellite.satellite_id, satellite);
+impl RtcmDecoder {
+
+    pub fn new(use_rtklib_method:bool) -> Self {
+        let rtcm_data = BTreeMap::new();
+        let lock_status = LockStatus::new(use_rtklib_method);
+        Self {first_epoch:None, last_epoch:None, rtcm_data, lock_status}
     }
 
-    let mut i = 0;
-    for signal in msg.data_segment.signal_data.iter() {
-    
-        let cnr_u8:Option<u8> = signal.gnss_signal_cnr_dbhz;
-        let mut cnr_f64:Option<f64> = None;
-
-        if cnr_u8.is_some() {
-            cnr_f64 = Some(cnr_u8.unwrap() as f64);
-        } 
-
-        let signal:MsmData  = MsmData {
-            constellation: Constellation::GPS, 
-            satellite_id: signal.satellite_id, 
-            band: signal.signal_id.band(),
-            attribute: signal.signal_id.attribute(),
-            rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
-            rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
-            rough_phase_range_rate: None, 
-            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ind as u16,
-            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
-            fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ms,
-            fine_phase_range: signal.gnss_signal_fine_phaserange_ms,
-            fine_phase_range_rate: None, 
-            cnr: cnr_f64
-        };
-
-        process_signals(&mut observations, signal, lock_status, current_epoch);
-
-        i += 1;
-        
-        for a in observations.iter() {
-            for b in a.1.iter() {
-                println!("   {} {}: {} ({:?})", a.0, b.0, b.1.obs, b.1.lli);
-            }
-        }
+    pub fn clear(&mut self) {
+        self.first_epoch = None;
+        self.last_epoch = None;
+        self.rtcm_data = BTreeMap::new();
     }
 
-    return observations;
-        
-}
-
-pub fn process_msm1077( msg:Msg1077T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
-    
-    let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
-    
-                                
-    let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
-        
-    for satellite in msg.data_segment.satellite_data.iter() {
-        satellites.insert(satellite.satellite_id, satellite);
+    pub fn get_first_epoch(&self) -> Option<Epoch> {
+        self.first_epoch.clone()
     }
 
-    let mut i = 0;
-    for signal in msg.data_segment.signal_data.iter() {
-        
-        let signal:MsmData  = MsmData {
-            constellation: Constellation::GPS, 
-            satellite_id: signal.satellite_id, 
-            band: signal.signal_id.band(),
-            attribute: signal.signal_id.attribute(),
-            rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
-            rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
-            rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
-            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
-            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
-            fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
-            fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
-            fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
-            cnr: signal.gnss_signal_cnr_ext_dbhz,
-        };
-
-        process_signals(&mut observations, signal, lock_status, current_epoch);
-
-        i += 1;
-        
-        for a in observations.iter() {
-            for b in a.1.iter() {
-                println!("   {} {}: {} ({:?})", a.0, b.0, b.1.obs, b.1.lli);
-            }
-        }
+    pub fn get_last_epoch(&self) -> Option<Epoch> {
+        self.last_epoch.clone()
     }
 
-    return observations;
-        
-}
-
-pub fn process_msm1094( msg:Msg1094T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
-    
-    let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
-                                
-    let mut satellites:HashMap<u8,&Msm46Sat>  = HashMap::new();
-        
-    for satellite in msg.data_segment.satellite_data.iter() {
-        satellites.insert(satellite.satellite_id, satellite);
+    pub fn get_rtcm_data(&self) -> RtcmData {
+        self.rtcm_data.clone()
     }
 
-    let mut i = 0;
-    for signal in msg.data_segment.signal_data.iter() {
-    
-        let cnr_u8:Option<u8> = signal.gnss_signal_cnr_dbhz;
-        let mut cnr_f64:Option<f64> = None;
+    fn process_signals(&mut self, signal:MsmData, msm_epoch:Epoch)  {
+                            
+        // modeled on RKTLIB msm7 decoder 
+        // see: https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtcm3.c#L1987
 
-        if cnr_u8.is_some() {
-            cnr_f64 = Some(cnr_u8.unwrap() as f64);
-        } 
-
-        let signal:MsmData  = MsmData {
-            constellation: Constellation::GPS, 
-            satellite_id: signal.satellite_id, 
-            band: signal.signal_id.band(),
-            attribute: signal.signal_id.attribute(),
-            rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
-            rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
-            rough_phase_range_rate: None, 
-            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ind as u16,
-            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
-            fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ms,
-            fine_phase_range: signal.gnss_signal_fine_phaserange_ms,
-            fine_phase_range_rate: None, 
-            cnr: cnr_f64
-        };
-
-        process_signals(&mut observations, signal, lock_status, current_epoch);
-
-        i += 1;
-        
-        for a in observations.iter() {
-            for b in a.1.iter() {
-                println!("   {} {}: {} ({:?})", a.0, b.0, b.1.obs, b.1.lli);
-            }
-        }
-    }
-
-    return observations;
-        
-}
-
-pub fn process_msm1097( msg:Msg1097T, lock_status:&mut LockStatus, current_epoch:&Epoch)  -> BTreeMap<SV, HashMap<Observable, ObservationData>> {
-    
-    let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
-                                
-    let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
-        
-    for satellite in msg.data_segment.satellite_data.iter() {
-        satellites.insert(satellite.satellite_id, satellite);
-    }
-
-    let mut i = 0;
-    for signal in msg.data_segment.signal_data.iter() {
-    
-
-        if signal.satellite_id == 11 {
-            println!("debug")
+        if self.first_epoch.is_none() || self.first_epoch.unwrap().gt(&msm_epoch) {
+            self.first_epoch = Some(msm_epoch);
         }
 
-        let signal:MsmData  = MsmData {
-            constellation: Constellation::Galileo, 
-            satellite_id: signal.satellite_id, 
-            band: signal.signal_id.band(),
-            attribute: signal.signal_id.attribute(),
-            rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
-            rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
-            rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
-            loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
-            half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
-            fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
-            fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
-            fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
-            cnr: signal.gnss_signal_cnr_ext_dbhz
-            
-        };
+        if self.last_epoch.is_none() || self.last_epoch.unwrap().lt(&msm_epoch) {
+            self.last_epoch = Some(msm_epoch);
+        }
 
-        process_signals(&mut observations, signal, lock_status, current_epoch);
-
-        i += 1;
+        if !self.rtcm_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
+            let mut epoch_group = (Some(0 as f64), BTreeMap::new());
+            self.rtcm_data.insert((msm_epoch, EpochFlag::Ok), epoch_group);   
+        }
         
-    }
-
-    return observations;
+        let epoch_data = self.rtcm_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.borrow_mut();
         
-}
 
-fn extract_observed_signals(obs_data:&BTreeMap<SV, HashMap<Observable, ObservationData>>, observed_signals:&mut HashSet<(Constellation, String)>) {
+        let code_str = format!("{}{}", signal.band, signal.attribute);
 
-    for sv in obs_data.keys() {
-        let constellation = sv.constellation;
-        let observations = obs_data.get(&sv).unwrap();
-        for observable in observations.keys() {
-            let code = observable.code().unwrap();
-            observed_signals.insert((constellation, code));
+        let frequency:f64 = get_frequency(signal.constellation, signal.band);
+        let wavelength:f64 = frequency / C_LIGHT;
+        
+        let sv_key = SV {constellation:signal.constellation, prn: signal.satellite_id};
+
+        if !epoch_data.contains_key(&sv_key) {
+            epoch_data.insert(sv_key, HashMap::new());
         }   
-    }
-}
+        
+        let observation_data = epoch_data.get_mut(&sv_key).unwrap();   
 
-pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
+        let mut range:Option<f64>  = None;
+        if signal.rough_range.is_some() {
+            range = Some(((signal.rough_range.unwrap() as f64) * RANGE_MS) + (signal.rough_range_mod1ms  * RANGE_MS));
+        }
+
+        let mut lli:Option<LliFlags> = self.lock_status.update_lock_status(&sv_key, &code_str, &msm_epoch, signal.loss_of_lock_indicator, signal.half_cycle_ambiguity);
+
     
-    println!("converting rtcm file: {}", file_path);
-    let mut rtcm_file = File::open(file_path).expect(format!("Unable to open file: {}", file_path).as_str());
+        let mut rough_phase_range_rate:Option<f64> = None;
+        if signal.rough_phase_range_rate.is_some()  {
+            rough_phase_range_rate = Some(signal.rough_phase_range_rate.unwrap() as f64);
+        } 
+        
+        let mut fine_phase_range_rate:Option<f64> = None;
+        if signal.fine_phase_range_rate.is_some() {
+            fine_phase_range_rate = signal.fine_phase_range_rate;
+        }
+        
+        let mut fine_pseudo_range:Option<f64> = None;
+        if signal.fine_pseudo_range.is_some() {
+            fine_pseudo_range =  Some((signal.fine_pseudo_range.unwrap() as f64)  * RANGE_MS);
+        }     
 
-    let mut rtcm_buffer = Vec::<u8>::new();
+        let mut fine_pseudo_range:Option<f64> = None;
+        if signal.fine_pseudo_range.is_some() {
+            fine_pseudo_range = Some((signal.fine_pseudo_range.unwrap() as f64)  * RANGE_MS);
+        }
 
-    if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
+        let mut fine_phase_range:Option<f64> = None;
+        if signal.fine_phase_range.is_some() {
+            fine_phase_range = Some((signal.fine_phase_range.unwrap() as f64)  * RANGE_MS);
+        }
+        
+        
+        if range.is_some() && fine_pseudo_range.is_some() {
+            let pseudo_range_obs = (range.unwrap() + fine_pseudo_range.unwrap());
+            let code = Observable::PseudoRange(format!("C{}", code_str));
+            observation_data.insert(code, 
+                                    ObservationData {obs:pseudo_range_obs, lli: None, snr: None});
+        }
+    
+        if range.is_some() && fine_phase_range.is_some() {
+            let phase_range_obs =(range.unwrap() + fine_phase_range.unwrap()) * wavelength; 
+            let code = Observable::Phase(format!("L{}", code_str));
+            observation_data.insert(code, 
+                                    ObservationData {obs:phase_range_obs, lli: lli, snr: None});
+        }
+        
+        if rough_phase_range_rate.is_some() && fine_phase_range_rate.is_some() {
+            let phase_range_rate_obs:f64 = (-(rough_phase_range_rate.unwrap() + fine_phase_range_rate.unwrap())) * wavelength;
+            let code = Observable::Doppler(format!("D{}", code_str));
+            observation_data.insert(code, 
+                                    ObservationData {obs:phase_range_rate_obs, lli: None, snr: None});
+        }
+        
+        if signal.cnr.is_some() {
+            let cnr_obs = (signal.cnr.unwrap() as f64);
+            let code = Observable::SSI(format!("S{}", code_str));
+            observation_data.insert(code, 
+                                    ObservationData {obs:cnr_obs, lli: None, snr: None});
+        }
 
-        // implement optional compressed rnx ?
-        let crinex:Option<Crinex> = Some(Crinex {version : Version {major: 3, minor: 0}, prog: "rtcm2rnx".to_string(), date: Epoch::now().unwrap()});  
+    }
 
-        let scaling:HashMap<(Constellation, Observable), u16> = HashMap::new();
+    pub fn process_msm1074(&mut self, msg:Msg1074T, msm_epoch:Epoch) {
+                              
+        let mut satellites:HashMap<u8,&Msm46Sat>  = HashMap::new();
+            
+        for satellite in msg.data_segment.satellite_data.iter() {
+            satellites.insert(satellite.satellite_id, satellite);
+        }
 
-        let mut rinex_data : BTreeMap<(Epoch, EpochFlag), (Option<f64>, BTreeMap<SV, HashMap<Observable, ObservationData>>)> = BTreeMap::new();
-        let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
+        let mut i = 0;
+        for signal in msg.data_segment.signal_data.iter() {
+        
+            let cnr_u8:Option<u8> = signal.gnss_signal_cnr_dbhz;
+            let mut cnr_f64:Option<f64> = None;
 
-   
-        // converting rtcm file: data_trace/2024-10-03_17-32-47.pi4.rtcm.log
-        // galileo week: 1310
-        // gps week: 2334
+            if cnr_u8.is_some() {
+                cnr_f64 = Some(cnr_u8.unwrap() as f64);
+            } 
 
-        let mut gps_week:Option<u64>  = Some(2334);
-        let mut galileo_week:Option<u64>  = Some(1310);
+            let signal:MsmData  = MsmData {
+                constellation: Constellation::GPS, 
+                satellite_id: signal.satellite_id, 
+                band: signal.signal_id.band(),
+                attribute: signal.signal_id.attribute(),
+                rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
+                rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
+                rough_phase_range_rate: None, 
+                loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ind as u16,
+                half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
+                fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ms,
+                fine_phase_range: signal.gnss_signal_fine_phaserange_ms,
+                fine_phase_range_rate: None, 
+                cnr: cnr_f64
+            };
 
-        let mut first_epoch:Option<Epoch> = None;
-        let mut last_epoch:Option<Epoch> = None;
+            self.process_signals(signal, msm_epoch);
+    
+        }
+            
+    }
 
-        let mut lock_status:LockStatus = LockStatus::new(use_rtklib_lli);
+    pub fn process_msm1077(&mut self, msg:Msg1077T, msm_epoch:Epoch) {
+                                  
+        let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
+            
+        for satellite in msg.data_segment.satellite_data.iter() {
+            satellites.insert(satellite.satellite_id, satellite);
+        }
 
-        let mut observed_signals: HashSet<(Constellation, String)> = HashSet::new();
+        for signal in msg.data_segment.signal_data.iter() {
+            
+            let signal:MsmData  = MsmData {
+                constellation: Constellation::GPS, 
+                satellite_id: signal.satellite_id, 
+                band: signal.signal_id.band(),
+                attribute: signal.signal_id.attribute(),
+                rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
+                rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
+                rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
+                loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
+                half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
+                fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
+                fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
+                fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
+                cnr: signal.gnss_signal_cnr_ext_dbhz,
+            };
 
-        for message_frame in &mut iterator {
-            if message_frame.message_number().is_some() {
+            self.process_signals(signal, msm_epoch);
+
+        }
+            
+    }
+
+    pub fn process_msm1094(&mut self, msg:Msg1094T,msm_epoch:Epoch) {
+                                  
+        let mut satellites:HashMap<u8,&Msm46Sat>  = HashMap::new();
+            
+        for satellite in msg.data_segment.satellite_data.iter() {
+            satellites.insert(satellite.satellite_id, satellite);
+        }
+
+        for signal in msg.data_segment.signal_data.iter() {
+        
+            let cnr_u8:Option<u8> = signal.gnss_signal_cnr_dbhz;
+            let mut cnr_f64:Option<f64> = None;
+
+            if cnr_u8.is_some() {
+                cnr_f64 = Some(cnr_u8.unwrap() as f64);
+            } 
+
+            let signal:MsmData  = MsmData {
+                constellation: Constellation::GPS, 
+                satellite_id: signal.satellite_id, 
+                band: signal.signal_id.band(),
+                attribute: signal.signal_id.attribute(),
+                rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
+                rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
+                rough_phase_range_rate: None, 
+                loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ind as u16,
+                half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
+                fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ms,
+                fine_phase_range: signal.gnss_signal_fine_phaserange_ms,
+                fine_phase_range_rate: None, 
+                cnr: cnr_f64
+            };
+
+            self.process_signals(signal, msm_epoch);
+
+        }
+            
+    }
+
+    pub fn process_msm1097(&mut self, msg:Msg1097T, msm_epoch:Epoch) {
+        
+        let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
+                                    
+        let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
+            
+        for satellite in msg.data_segment.satellite_data.iter() {
+            satellites.insert(satellite.satellite_id, satellite);
+        }
+
+        for signal in msg.data_segment.signal_data.iter() {
+
+            let signal:MsmData  = MsmData {
+                constellation: Constellation::Galileo, 
+                satellite_id: signal.satellite_id, 
+                band: signal.signal_id.band(),
+                attribute: signal.signal_id.attribute(),
+                rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
+                rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
+                rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
+                loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
+                half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
+                fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
+                fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
+                fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
+                cnr: signal.gnss_signal_cnr_ext_dbhz
+                
+            };
+
+            self.process_signals(signal, msm_epoch);
+            
+        }
+            
+    }
+
+    // convenience function for rinex library to build header table of observed signal codes by constellation (e.g. GPS: C1C, L5Q ... )
+    pub fn extract_observed_signals(&self) -> HashSet<(Constellation, String)> {
+
+        let mut observed_signals = HashSet::new();
+
+        for epoch in self.rtcm_data.values() {
+            for sv in epoch.1.keys() {
+                let constellation = sv.constellation;
+                let observations = epoch.1.get(&sv).unwrap();
+                for observable in observations.keys() {
+                    let code = observable.code().unwrap();
+                    observed_signals.insert((constellation, code));
+                }   
+            }
+        }
+
+        observed_signals
+    }
+
+    pub fn load_file(&mut self, file_path:&Path) {
+
+        info!("converting rtcm file: {}", file_path.to_str().unwrap());
+
+        let mut rtcm_file = File::open(file_path).expect(format!("Unable to open file: {}", file_path.to_str().unwrap()).as_str());
+
+        let mut rtcm_buffer = Vec::<u8>::new();
+
+        if let Ok(_) = rtcm_file.read_to_end(&mut rtcm_buffer) {
+
+            let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
+
+            let mut gps_week:Option<u64>  = None;
+            let mut galileo_week:Option<u64>  = None;
+
+       
+
+            for message_frame in &mut iterator {
+                if message_frame.message_number().is_some() {
                 
                     let msg_data = message_frame.get_message();
                     match msg_data {
@@ -640,35 +633,8 @@ pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
 
                                 let time = msg1074.gps_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_gps_time2epoch(time, gps_week.unwrap());
-
-                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
-                                    first_epoch = Some(msm_epoch);
-                                }
-
-                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
-                                    last_epoch = Some(msm_epoch);
-                                }
                                 
-                                let mut buff:[u8; 1200] = [0;1200];
-
-                                let mut i = 0;
-                                for u in message_frame.frame_data().iter() {
-                                    buff[i] = *u;
-                                    i += 1;
-                                }
-
-                                let mut observations = process_msm1074(msg1074, &mut lock_status,&msm_epoch);
-
-                                extract_observed_signals(&observations, &mut observed_signals); 
-
-                                if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
-                                    rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
-                                
-                                }
-                                else {
-                                    let mut observation_group = (Some(0 as f64), observations);
-                                    rinex_data.insert((msm_epoch, EpochFlag::Ok), observation_group);
-                                }
+                                self.process_msm1074(msg1074, msm_epoch);
                             }
                             
                         }      
@@ -682,34 +648,7 @@ pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
                                 let time = msg1077.gps_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_gps_time2epoch(time, gps_week.unwrap());
 
-                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
-                                    first_epoch = Some(msm_epoch);
-                                }
-
-                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
-                                    last_epoch = Some(msm_epoch);
-                                }
-                                
-                                let mut buff:[u8; 1200] = [0;1200];
-
-                                let mut i = 0;
-                                for u in message_frame.frame_data().iter() {
-                                    buff[i] = *u;
-                                    i += 1;
-                                }
-
-                                let mut observations = process_msm1077(msg1077, &mut lock_status,&msm_epoch);
-
-                                extract_observed_signals(&observations, &mut observed_signals); 
-
-                                if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
-                                    rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
-                                
-                                }
-                                else {
-                                    let mut observation_group = (Some(0 as f64), observations);
-                                    rinex_data.insert((msm_epoch, EpochFlag::Ok), observation_group);
-                                }
+                                self.process_msm1077(msg1077, msm_epoch);
                             }
                             
                         }      
@@ -722,34 +661,7 @@ pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
                                 let time = msg1094.gal_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
-                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
-                                    first_epoch = Some(msm_epoch);
-                                }
-
-                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
-                                    last_epoch = Some(msm_epoch);
-                                }
-
-                                let mut buff:[u8; 1200] = [0;1200];
-
-                                let mut i = 0;
-                                for u in message_frame.frame_data().iter() {
-                                    buff[i] = *u;
-                                    i += 1;
-                                }
-
-                                let mut observations = process_msm1094(msg1094, &mut lock_status, &msm_epoch);
-
-                                extract_observed_signals(&observations, &mut observed_signals); 
-
-                                if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
-                                    rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
-                                
-                                }
-                                else {
-                                    let mut observation_group = (Some(0 as f64), observations);
-                                    rinex_data.insert((msm_epoch, EpochFlag::Ok), observation_group);
-                                }
+                                self.process_msm1094(msg1094, msm_epoch);
                             }
                             
                         }         
@@ -762,34 +674,8 @@ pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
                                 let time = msg1097.gal_epoch_time_ms as f64;
                                 let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
-                                if first_epoch.is_none() || first_epoch.unwrap().gt(&msm_epoch) {
-                                    first_epoch = Some(msm_epoch);
-                                }
+                                self.process_msm1097(msg1097, msm_epoch);
 
-                                if last_epoch.is_none() || last_epoch.unwrap().lt(&msm_epoch) {
-                                    last_epoch = Some(msm_epoch);
-                                }
-
-                                let mut buff:[u8; 1200] = [0;1200];
-
-                                let mut i = 0;
-                                for u in message_frame.frame_data().iter() {
-                                    buff[i] = *u;
-                                    i += 1;
-                                }
-
-                                let mut observations = process_msm1097(msg1097, &mut lock_status, &msm_epoch);
-
-                                extract_observed_signals(&observations, &mut observed_signals); 
-
-                                if rinex_data.contains_key(&(msm_epoch, EpochFlag::Ok)) {
-                                    rinex_data.get_mut(&(msm_epoch, EpochFlag::Ok)).unwrap().1.append(&mut observations);
-                                
-                                }
-                                else {
-                                    let mut observation_group = (Some(0 as f64), observations);
-                                    rinex_data.insert((msm_epoch, EpochFlag::Ok), observation_group);
-                                }
                             }
                             
                         }         
@@ -799,62 +685,9 @@ pub fn convert_file(file_path:&String, use_rtklib_lli:bool) {
                         }
                     }
                 }   
+            }
         }
-
-        let mut codes:HashMap<Constellation, Vec<Observable>> = HashMap::new();
-
-        let mut gps_codes:Vec<String> = observed_signals.extract_if(|c|c.0 == Constellation::GPS).map(|c: (Constellation, String)|c.1).collect();
-        gps_codes.sort();
-
-
-        let mut gps_observables:Vec<Observable> = Vec::new();
-
-        for code in gps_codes.iter() {
-            gps_observables.push(Observable::PseudoRange(format!("C{}", code)));
-            gps_observables.push(Observable::Phase(format!("L{}", code)));
-            gps_observables.push(Observable::Doppler(format!("D{}", code)));
-            gps_observables.push(Observable::SSI(format!("S{}", code)));
-        }
-
-        codes.insert(Constellation::GPS, gps_observables);
-
-        let mut galileo_codes:Vec<String> = observed_signals.extract_if(|c|c.0 == Constellation::Galileo).map(|c: (Constellation, String)|c.1).collect();
-        galileo_codes.sort();
-
-        let mut galileo_observables:Vec<Observable> = Vec::new();
-
-        for code in galileo_codes.iter() {
-
-            galileo_observables.push(Observable::PseudoRange(format!("C{}", code)));
-            galileo_observables.push(Observable::Phase(format!("L{}", code)));
-            galileo_observables.push(Observable::Doppler(format!("D{}", code)));
-            galileo_observables.push(Observable::SSI(format!("S{}", code)));
-
-        }
-
-        codes.insert(Constellation::Galileo, galileo_observables);
-          
-        let header_fields = HeaderFields {crinex : None, time_of_first_obs: first_epoch, time_of_last_obs: last_epoch, codes:codes, clock_offset_applied: false, scaling: scaling};
-
-        let header : Header = Header::basic_obs();
-        let header_obs = header.with_version(Version::new(3, 0)).with_observation_fields(header_fields);
-        
-        let record = rinex::record::Record::ObsRecord(rinex_data);
-        let rinex = Rinex::new(header_obs, record);
-
-
-        let mut rnx_path;
-        
-        if use_rtklib_lli {
-            rnx_path = format!("{}.rtklib.rnx", file_path);
-        }
-        else {
-            rnx_path = format!("{}.rnx", file_path);
-        }
-        
-        rinex.to_file(&rnx_path).expect("unable to write file");
-
-        println!("complete! RINEX file output: {}", rnx_path);
     }
 }
+
 
