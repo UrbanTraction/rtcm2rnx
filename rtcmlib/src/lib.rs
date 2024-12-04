@@ -669,7 +669,7 @@ impl RtcmDecoder {
 
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
                         Message::Msg1042(msg1042) => {
-                            galileo_week = Some(msg1042.bds_week_number as u64);  
+                            bds_week = Some(msg1042.bds_week_number as u64);  
                             println!("beidou week: {}", galileo_week.unwrap());
                         }
                         
