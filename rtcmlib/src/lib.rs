@@ -5,9 +5,8 @@ use hifitime::{Duration, Unit};
 use log::info;
 use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData, EpochFlag}, prelude::{Constellation, Epoch, Header, Observable, SV}, version::Version, Rinex};
 
-use rtcm_rs::{msg::{Msg1074T, Msg1077T, Msg1094T, Msg1097Data, Msg1097T, Msm46Sat, Msm57Sat}, Message, MsgFrameIter};
-
-
+use rtcm_rs::{msg::{Msg1074T, Msg1077T, Msg1094T, Msg1097Data, Msg1097T, Msg1127Data, Msg1127T, Msm46Sat, Msm57Sat}, Message, MsgFrameIter};
+use nyx_space::cosmic::SPEED_OF_LIGHT;
 // epoch/sv/observation map for data extracted from rtcm log 
 pub type RtcmData = BTreeMap<(Epoch, EpochFlag), (Option<f64>, BTreeMap<SV, HashMap<Observable, ObservationData>>)>;
 
@@ -20,9 +19,8 @@ const SECONDS_PER_WEEK:u64 = 86400 * 7;
 
 // const values transfered from rtklib.h and rtcm3.c
 // https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtklib.h#L84
-
-const C_LIGHT:f64 = 299792458.0;          // speed of light (m/s) 
-const RANGE_MS:f64 = C_LIGHT * 0.001;     // range in 1ms 
+      // speed of light (m/s) 
+const RANGE_MS:f64 = SPEED_OF_LIGHT * 0.001;     // range in 1ms 
 
 const FREQL1:f64 = 1.57542e9;          /* L1/E1  frequency (Hz) */
 const FREQL2:f64 = 1.22760e9;           /* L2     frequency (Hz) */
@@ -289,6 +287,20 @@ pub fn rtcm_galileo_time2epoch(tow_ms:f64, week:u64) -> Epoch {
     return t;
 }
 
+pub fn rtcm_bds_time2epoch(tow_ms:f64, week:u64) -> Epoch {
+    
+    let mut tow_sec = tow_ms / 1000.0;
+
+    if tow_sec < -1e9 || 1e9 < tow_sec {
+        tow_sec = 0.0;
+    }
+
+    let t = Epoch::from_bdt_seconds(((week * SECONDS_PER_WEEK) as f64) + tow_sec);
+
+    return t;
+}
+
+
 
 
 
@@ -350,7 +362,7 @@ impl RtcmDecoder {
         let code_str = format!("{}{}", signal.band, signal.attribute);
 
         let frequency:f64 = get_frequency(signal.constellation, signal.band);
-        let wavelength:f64 = frequency / C_LIGHT;
+        let wavelength:f64 = frequency / SPEED_OF_LIGHT;
         
         let sv_key = SV {constellation:signal.constellation, prn: signal.satellite_id};
 
@@ -570,6 +582,41 @@ impl RtcmDecoder {
             
     }
 
+    pub fn process_msm1127(&mut self, msg:Msg1127T, msm_epoch:Epoch) {
+        
+        let mut observations: BTreeMap<SV, HashMap<Observable, ObservationData>> = BTreeMap::new();
+                                    
+        let mut satellites:HashMap<u8,&Msm57Sat>  = HashMap::new();
+            
+        for satellite in msg.data_segment.satellite_data.iter() {
+            satellites.insert(satellite.satellite_id, satellite);
+        }
+
+        for signal in msg.data_segment.signal_data.iter() {
+
+            let signal:MsmData  = MsmData {
+                constellation: Constellation::Galileo, 
+                satellite_id: signal.satellite_id, 
+                band: signal.signal_id.band(),
+                attribute: signal.signal_id.attribute(),
+                rough_range: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_integer_ms,
+                rough_range_mod1ms: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_range_mod1ms_ms as f64,
+                rough_phase_range_rate: satellites.get(&signal.satellite_id).unwrap().gnss_satellite_rough_phaserange_rates_m_s,
+                loss_of_lock_indicator: signal.gnss_phaserange_lock_time_ext_ind,
+                half_cycle_ambiguity: signal.half_cycle_ambiguity_ind,
+                fine_pseudo_range: signal.gnss_signal_fine_pseudorange_ext_ms,
+                fine_phase_range: signal.gnss_signal_fine_phaserange_ext_ms,
+                fine_phase_range_rate: signal.gnss_signal_fine_phaserange_rate_m_s,
+                cnr: signal.gnss_signal_cnr_ext_dbhz
+                
+            };
+
+            self.process_signals(signal, msm_epoch);
+            
+        }
+            
+    }
+
     // convenience function for rinex library to build header table of observed signal codes by constellation (e.g. GPS: C1C, L5Q ... )
     pub fn extract_observed_signals(&self) -> HashSet<(Constellation, String)> {
 
@@ -603,6 +650,7 @@ impl RtcmDecoder {
 
             let mut gps_week:Option<u64>  = None;
             let mut galileo_week:Option<u64>  = None;
+            let mut bds_week:Option<u64>  = None;
 
        
 
@@ -618,6 +666,13 @@ impl RtcmDecoder {
                             gps_week = Some(msg1019.gps_week_number as u64 + 1024 + 1024);   
                             println!("gps week: {}", gps_week.unwrap());
                         }
+
+                        // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
+                        Message::Msg1042(msg1042) => {
+                            galileo_week = Some(msg1042.bds_week_number as u64);  
+                            println!("beidou week: {}", galileo_week.unwrap());
+                        }
+                        
 
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
                         Message::Msg1046(msg1046) => {
@@ -678,7 +733,23 @@ impl RtcmDecoder {
 
                             }
                             
-                        }         
+                        } 
+
+                        // galileo msm7 
+                        Message::Msg1127(msg1127) => {
+                        
+                            // wait for ephemeris gpst week before processing MSM7
+                            if bds_week.is_some() {
+                                let time = msg1127.bds_epoch_time_ms as f64;
+                                let msm_epoch = rtcm_bds_time2epoch(time, galileo_week.unwrap());
+
+                                self.process_msm1127(msg1127, msm_epoch);
+
+                                println!("beidou 1127");
+
+                            }
+                            
+                        }              
 
                         _ => {
                             
