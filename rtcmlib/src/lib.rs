@@ -673,7 +673,6 @@ impl RtcmDecoder {
                             println!("beidou week: {}", galileo_week.unwrap());
                         }
                         
-
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
                         Message::Msg1046(msg1046) => {
                             galileo_week = Some(msg1046.gal_week_number as u64);  
@@ -735,7 +734,7 @@ impl RtcmDecoder {
                             
                         } 
 
-                        // galileo msm7 
+                        // bds msm7 
                         Message::Msg1127(msg1127) => {
                         
                             // wait for ephemeris gpst week before processing MSM7
