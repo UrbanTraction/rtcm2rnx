@@ -9,6 +9,7 @@ use cty::uint16_t;
 use float_cmp::approx_eq;
 use rinex::observation::LliFlags;
 use rinex::prelude::EpochFlag;
+use rtcm_rs::msg::Msg1127T;
 use rtcm_rs::{msg, Message, MsgFrameIter};
 use rtklib_sys::rtklib::{self, decode_msm7, obsd_t, rtcm_t};
 use rinex::{observation::{ HeaderFields, ObservationData}};
@@ -119,7 +120,7 @@ fn compare(rtklib_obs:&obsd_t, rtcmlib_observations:&BTreeMap<SV, HashMap<Observ
 #[test]
 fn process_rtcm() {
     // let ref mut cool = CoolStruct {x: 0, y: 0};
-    let file_path = "tests/data/debug.rtcm";
+    let file_path = "tests/data/debug_bds.rtcm";
     // unsafe { cool_function(2, 6, cool) }
     let mut rtcm_file = File::open(file_path).expect(format!("Unable to open file: {}", file_path).as_str());
 
@@ -132,8 +133,9 @@ fn process_rtcm() {
 
         let mut iterator = MsgFrameIter::new(rtcm_buffer.as_slice());
 
-        let mut gps_week:Option<u64>  = Some(2334);
-        let mut galileo_week:Option<u64>  = Some(1310);
+        let mut gps_week:Option<u64>  = Some(2339);
+        let mut galileo_week:Option<u64>  = Some(1315);
+        let mut bds_week:Option<u64>  = Some(983);
 
         for message_frame in &mut iterator {
             match message_frame.get_message() {
@@ -143,6 +145,12 @@ fn process_rtcm() {
                     // TODO handle GPS week rollover correctly
                     gps_week = Some(msg1019.gps_week_number as u64 + 1024 + 1024);   
                     println!("gps week: {}", gps_week.unwrap());
+                }
+
+                // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
+                Message::Msg1042(msg1042) => {
+                    bds_week = Some(msg1042.bds_week_number as u64);  
+                    println!("bds week: {}", bds_week.unwrap());
                 }
 
                 // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
@@ -250,13 +258,67 @@ fn process_rtcm() {
                     }
                 }
 
+                // bds
+                Message::Msg1127(msg1127) => {
+                        
+                    let time = msg1127.bds_epoch_time_ms as f64;
+                    let msm_epoch = rtcm_galileo_time2epoch(time, bds_week.unwrap());
+
+                    // todo add  rtklib test support for bds msm7
+                    //
+                    // unsafe { 
+                    //     let mut rtcm:MaybeUninit<rtcm_t> = MaybeUninit::zeroed();
+                    //     let rtcm_ptr = rtcm.as_mut_ptr();
+
+                        
+                    //     let mut buff:[u8;1200] = [0;1200]; 
+                    //     let mut i = 0;
+                    //     for b in message_frame.frame_data() {
+                    //         buff[i] = *b;
+                    //         i += 1;
+                    //     }
+                    
+                    //     let mut rtklib_observations:MaybeUninit<[obsd_t;24]>= MaybeUninit::zeroed(); 
+                    //     let rtklib_observations_ptr = rtklib_observations.assume_init_mut().as_mut_ptr();
+
+                    //     addr_of_mut!((*rtcm_ptr).obs.data).write(rtklib_observations_ptr);
+                    //     addr_of_mut!((*rtcm_ptr).buff).write(buff);
+                    //     addr_of_mut!((*rtcm_ptr).len).write( message_frame.frame_len() as i32);
+                        
+                    //     // calc rtklib values
+                    //     decode_msm7(rtcm.as_mut_ptr(), 0x08);
+
+                    //     // calc rtcmlib values
+                    //     let rtcmlib_observations = rtcm_decoder.process_msm1127(msg1127, msm_epoch);
+
+                    //     let mut obs_stats = 0;
+                    //     for rtklib_obs in rtklib_observations.assume_init() {
+                    //         if rtklib_obs.sat > 0 {
+
+                    //             // rtklib doesn't store prn internally -- need to decode their internal multi-constellation id
+                    //             // rtk_no = NSATGPS+NSATGLO+prn-MINPRNGAL+1 
+                    //             // this number will change if other constellations are enabled and can't be pulled from FFI as it's all #define
+                    //             let galileo_sat_no = rtklib_obs.sat - 32;
+
+                    //             obs_stats += 1;
+                    //             let sv = SV {prn: galileo_sat_no , constellation:Constellation::Galileo};
+
+                    //             let rtcm_data = rtcm_decoder.get_rtcm_data();
+                    //             let epoch_data = rtcm_data.get(&(msm_epoch, EpochFlag::Ok)).unwrap().1.borrow();
+                    //             compare(&rtklib_obs, epoch_data, sv);
+                    //         }
+                    //     }   
+                    // }
+                }
+
                 _ => {
                     println!("{}", message_frame.message_number().unwrap());
                 }
-            }
-            
+            }            
+
         }
+            
     }
-    
-    
 }
+    
+    
