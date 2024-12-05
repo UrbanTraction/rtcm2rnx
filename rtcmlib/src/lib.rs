@@ -3,7 +3,7 @@
 use std::{  borrow::{Borrow, BorrowMut}, collections::{BTreeMap, HashMap, HashSet}, fmt, fs::File, io::Read, path::Path, task::Context };
 use hifitime::{Duration, Unit};
 use log::info;
-use rinex::{observation::{ Crinex, HeaderFields, LliFlags, ObservationData, EpochFlag}, prelude::{Constellation, Epoch, Header, Observable, SV}, version::Version, Rinex};
+use rinex::{observation::{ Crinex, EpochFlag, HeaderFields, LliFlags, ObservationData}, prelude::{Carrier, Constellation, Epoch, Header, Observable, SV}, version::Version, Rinex};
 
 use rtcm_rs::{msg::{Msg1074T, Msg1077T, Msg1094T, Msg1097Data, Msg1097T, Msg1127Data, Msg1127T, Msm46Sat, Msm57Sat}, Message, MsgFrameIter};
 use nyx_space::cosmic::SPEED_OF_LIGHT;
@@ -17,28 +17,8 @@ pub mod prelude {
 
 const SECONDS_PER_WEEK:u64 = 86400 * 7;
 
-// const values transfered from rtklib.h and rtcm3.c
-// https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtklib.h#L84
-      // speed of light (m/s) 
+// speed of light (m/s) into m/ms
 const RANGE_MS:f64 = SPEED_OF_LIGHT * 0.001;     // range in 1ms 
-
-const FREQL1:f64 = 1.57542e9;          /* L1/E1  frequency (Hz) */
-const FREQL2:f64 = 1.22760e9;           /* L2     frequency (Hz) */
-const FREQE5_B:f64 = 1.20714e9;           /* E5b    frequency (Hz) */
-const FREQL5:f64 = 1.17645e9;           /* L5/E5a/B2a frequency (Hz) */
-const FREQL6:f64 = 1.27875e9;           /* E6/L6 frequency (Hz) */
-const FREQE5_AB:f64 = 1.191795e9;          /* E5a+b  frequency (Hz) */
-const FREQ_S:f64 = 2.492028e9;           /* S      frequency (Hz) */
-const FREQ1_GLO:f64 = 1.60200e9;           /* GLONASS G1 base frequency (Hz) */
-const DFRQ1_GLO:f64 = 0.56250e6;           /* GLONASS G1 bias frequency (Hz/n) */
-const FREQ2_GLO:f64 = 1.24600e9;           /* GLONASS G2 base frequency (Hz) */
-const DFRQ2_GLO:f64 = 0.43750e6;           /* GLONASS G2 bias frequency (Hz/n) */
-const FREQ3_GLO:f64 = 1.202025e9;          /* GLONASS G3 frequency (Hz) */
-const FREQ1_A_GLO:f64 = 1.600995e9;          /* GLONASS G1a frequency (Hz) */
-const FREQ2_A_GLO:f64 = 1.248060e9;          /* GLONASS G2a frequency (Hz) */
-const FREQ1_CMP:f64 = 1.561098e9;          /* BDS B1I     frequency (Hz) */
-const FREQ2_CMP:f64 = 1.20714e9;           /* BDS B2I/B2b frequency (Hz) */
-const FREQ3_CM:f64 = 1.26852e9;          /* BDS B3      frequency (Hz) */
 
 const DEFAULT_LLI:u16 = 0;
 
@@ -216,48 +196,6 @@ impl LockStatus {
 }
 
 
-
-
-// constillation + code to frequency from RKTLIB:
-// https://github.com/rtklibexplorer/RTKLIB/blob/demo5/src/rtkcmn.c#L733
-
-fn get_frequency_gps(band:u8) -> f64 {
-
-    match band {
-        1 => { return FREQL1 }
-        2 => { return FREQL2 }
-        5 => { return FREQL5 }
-        _ => { panic!("frequency not found"); }
-    }
-}
-
-fn get_frequency_galileo(band:u8) -> f64 {
-
-    match band {
-        1 => { return FREQL1 }
-        7 => { return FREQE5_B }
-        5 => { return FREQL5 }
-        6 => { return FREQL6 }
-        8 => { return FREQE5_AB }
-        _ => { panic!("frequency not found"); }
-    }
-
-}
-
-fn get_frequency(constellation:Constellation, band:u8) -> f64 {
-    match constellation {
-        Constellation::GPS => {
-            return get_frequency_gps(band);
-        }
-        Constellation::Galileo => {
-            return get_frequency_galileo(band);
-        }
-        _ => {
-            panic!("frequency not found");
-        }
-    }
-}
-
 // time conversion from GPS and Galileo time of week (ms) + GPS/Galileo week period
 // see RTKLIB for implementation reference: https://github.com/tomojitakasu/RTKLIB/blob/71db0ffa0d9735697c6adfd06fdf766d0e5ce807/src/rtkcmn.c#L1246
 
@@ -360,11 +298,13 @@ impl RtcmDecoder {
         
 
         let code_str = format!("{}{}", signal.band, signal.attribute);
-
-        let frequency:f64 = get_frequency(signal.constellation, signal.band);
-        let wavelength:f64 = frequency / SPEED_OF_LIGHT;
+        // build example pr observable to use rinex carrier frequency tables
+        let obs_key= Observable::PseudoRange(format!("C{}", code_str));
         
         let sv_key = SV {constellation:signal.constellation, prn: signal.satellite_id};
+
+        let frequency:f64 = Carrier::from_observable(signal.constellation, &obs_key).unwrap().frequency();
+        let wavelength:f64 = frequency / SPEED_OF_LIGHT;
 
         if !epoch_data.contains_key(&sv_key) {
             epoch_data.insert(sv_key, HashMap::new());
@@ -595,7 +535,7 @@ impl RtcmDecoder {
         for signal in msg.data_segment.signal_data.iter() {
 
             let signal:MsmData  = MsmData {
-                constellation: Constellation::Galileo, 
+                constellation: Constellation::BeiDou, 
                 satellite_id: signal.satellite_id, 
                 band: signal.signal_id.band(),
                 attribute: signal.signal_id.attribute(),
@@ -670,7 +610,7 @@ impl RtcmDecoder {
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
                         Message::Msg1042(msg1042) => {
                             bds_week = Some(msg1042.bds_week_number as u64);  
-                            println!("beidou week: {}", galileo_week.unwrap());
+                            println!("beidou week: {}", bds_week.unwrap());
                         }
                         
                         // galileo i/nav ephemeris (need to check f/nav 1042 as well?)
@@ -689,8 +629,7 @@ impl RtcmDecoder {
                                 let msm_epoch = rtcm_gps_time2epoch(time, gps_week.unwrap());
                                 
                                 self.process_msm1074(msg1074, msm_epoch);
-                            }
-                            
+                            }  
                         }      
 
                         // gps msm7 
@@ -704,7 +643,6 @@ impl RtcmDecoder {
 
                                 self.process_msm1077(msg1077, msm_epoch);
                             }
-                            
                         }      
 
                         // galileo msm7 
@@ -717,7 +655,6 @@ impl RtcmDecoder {
 
                                 self.process_msm1094(msg1094, msm_epoch);
                             }
-                            
                         }         
 
                         // galileo msm7 
@@ -729,9 +666,7 @@ impl RtcmDecoder {
                                 let msm_epoch = rtcm_galileo_time2epoch(time, galileo_week.unwrap());
 
                                 self.process_msm1097(msg1097, msm_epoch);
-
-                            }
-                            
+                            }            
                         } 
 
                         // bds msm7 
@@ -740,14 +675,10 @@ impl RtcmDecoder {
                             // wait for ephemeris gpst week before processing MSM7
                             if bds_week.is_some() {
                                 let time = msg1127.bds_epoch_time_ms as f64;
-                                let msm_epoch = rtcm_bds_time2epoch(time, galileo_week.unwrap());
-
+                                let msm_epoch = rtcm_bds_time2epoch(time, bds_week.unwrap());
                                 self.process_msm1127(msg1127, msm_epoch);
 
-                                println!("beidou 1127");
-
                             }
-                            
                         }              
 
                         _ => {

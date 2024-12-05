@@ -1,6 +1,9 @@
-/target
+target
+rtcmlib/target
 Cargo.lock
 /data/
 /data_trace/
 .vscode
-.DS_Store
+/.DS_Store
+tests/.DS_Store
+convbin
